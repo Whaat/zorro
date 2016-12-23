@@ -69,7 +69,7 @@ module DM::Zorro
         @ip1.pick view, x, y
         if @ip1.valid?
           @state = 1
-          Sketchup::set_status_text("Draw cut line through geometry.  CTRL=Cut Nested Geometry", SB_PROMPT)
+          Sketchup::set_status_text("Draw cut line through geometry.  Hold CTRL to cut through nested groups and components.", SB_PROMPT)
           @xdown = x
           @ydown = y
           @x1=x
@@ -183,8 +183,9 @@ module DM::Zorro
     end
 
     def cut_geometry(view)
+      Sketchup.active_model.start_operation("Zorro",true)
+
       eye=view.camera.eye
-      direction=view.camera.direction
       p1=@ip1.position
       p2=@ip2.position
       s1=view.screen_coords(p1)
@@ -192,43 +193,28 @@ module DM::Zorro
       ray1=view.pickray(s1.x,s1.y)
       ray2=view.pickray(s2.x,s2.y)
 
-      #offset the picked points to ensure that the knife will cut through the geometry if the user snaps to an edge
-      cut_vector=p1-p2
-
-      v1=Geom::Vector3d.new(eye.x-@ip1.position.x,eye.y-@ip1.position.y,eye.z-@ip1.position.z).normalize!.reverse!
-      v2=Geom::Vector3d.new(eye.x-@ip2.position.x,eye.y-@ip2.position.y,eye.z-@ip2.position.z).normalize!.reverse!
       sv1=ray1[1]
       sv2=ray2[1]
 
-      trans=Geom::Transformation.scaling(eye,1000000000)
-      if sv1==sv2  #this occurs when camera is orthogonal
-        #p "orthogonal"
-        box=Sketchup.active_model.bounds
-        center=box.center
-        diagonal=box.diagonal
+      box=Sketchup.active_model.bounds
+      center=box.center
+      diagonal=box.diagonal
+      #get the distance from the center of the model to the bounding box
+      distance=eye.distance(center)+(2*diagonal)
 
-        #get the distance from the center of the model to the bounding box
-        distance=eye.distance(center)+(2*diagonal)
+      if sv1==sv2  #this occurs when camera is orthogonal
         p1=p1.offset(sv1.reverse,distance)
         p2=p2.offset(sv2.reverse,distance)
         p3=p1.offset(sv1,2*distance)
         p4=p2.offset(sv2,2*distance)
-
       else
-        p1.transform! trans
-        p2.transform! trans
-      end
-
-      if Sketchup.version[0,1].to_i >= 7
-        Sketchup.active_model.start_operation("Zorro",true)
-      else
-        Sketchup.active_model.start_operation("Zorro")
+        p1 = p1.offset(sv1, 2*distance)
+        p2 = p2.offset(sv2, 2*distance)
       end
 
       ents=Sketchup.active_model.active_entities
       knife_group=ents.add_group
       knife_ents=knife_group.entities
-      sel=Sketchup.active_model.selection
       knife=knife_ents.add_face(eye,p1,p2) if sv1!=sv2
       knife=knife_ents.add_face(p1,p2,p4,p3) if sv1==sv2    #modified knife for orthogonal views
 
@@ -237,11 +223,13 @@ module DM::Zorro
         make_unique_zorro_cut(ents,Geom::Transformation.new,knife.plane)
         nested_slash(ents.parent,Geom::Transformation.new,knife_group,knife_group.transformation)
       else
-        edges=ents.intersect_with(false,Geom::Transformation.new,ents,Geom::Transformation.new,false,[knife_group])
+        ents.intersect_with(false,Geom::Transformation.new,ents,Geom::Transformation.new,false,[knife_group])
       end
       ents.erase_entities(knife_group)
-      delete_helpers()
+      delete_helpers
       Sketchup.active_model.commit_operation
+    rescue
+      Sketchup.active_model.abort_operation
     end
 
     def delete_helpers()
@@ -552,30 +540,48 @@ module DM::Zorro
   end #class
 
   def self.get_icon(name)
-    ext = Sketchup.platform == :platform_osx ? '.pdf' : '.svg'
+    ext = Sketchup.platform == :platform_osx ? '.png' : '.svg'
     File.join(File.dirname(__FILE__), 'images', name + ext)
   end
 
-  main_menu = UI.menu("Plugins")
-  toolbar = UI::Toolbar.new(PLUGIN_NAME)
-  main_menu = main_menu.add_submenu(PLUGIN_NAME)
+  unless file_loaded?(__FILE__)
+    main_menu = UI.menu("Plugins")
+    toolbar = UI::Toolbar.new(PLUGIN_NAME)
+    main_menu = main_menu.add_submenu(PLUGIN_NAME)
 
-  cmd = UI::Command.new("Zorro") { Sketchup.active_model.select_tool Zorro2Tool.new }
-  cmd.tooltip = "Zorro Slice Tool"
-  cmd.status_bar_text = "Create Edges by slicing through Objects"
-  cmd.large_icon = cmd.small_icon = self.get_icon('sword')
-  toolbar.add_item(cmd)
-  main_menu.add_item(cmd)
+    cmd = UI::Command.new("Zorro") { Sketchup.active_model.select_tool Zorro2Tool.new }
+    cmd.tooltip = "Zorro Slice Tool"
+    cmd.status_bar_text = "Create Edges by slicing through Objects"
+    cmd.large_icon = cmd.small_icon = self.get_icon('sword')
+    toolbar.add_item(cmd)
+    main_menu.add_item(cmd)
 
-  UI.add_context_menu_handler {|menu|
-    sel=Sketchup.active_model.selection.first
-    menu.add_separator
-    break unless sel
-    if sel.class == Sketchup::SectionPlane
-      menu.add_item("Slice Model at Section") {Zorro2Tool.new.slice_model_at_section(sel)}
+    case toolbar.get_last_state
+      when -1, 1 #never been shown or visible
+        toolbar.show
+      else
+        toolbar.hide
     end
-  }
 
-  file_loaded("Zorro2.rb")
+    UI.add_context_menu_handler {|menu|
+      sel=Sketchup.active_model.selection.first
+      menu.add_separator
+      next unless sel
+      if sel.class == Sketchup::SectionPlane
+        menu.add_item("Slice Model at Section") {Zorro2Tool.new.slice_model_at_section(sel)}
+      end
+    }
+  file_loaded(__FILE__)
+  end
+
+  PATH = File.dirname(__FILE__)
+  def self.reload
+    files = %w(
+      zorro.rb
+    )
+    files.each { |f|
+      load(File.join(PATH, f))
+    }
+  end
 
 end #module
